@@ -1,0 +1,276 @@
+#!/usr/bin/python3
+"""
+Outlook online calendar event popup notifications for the absent-minded
+
+
+Requires O365, dateutil, and PyQt5 packages
+
+Note: multiple-desktop users should configure their window manager to
+make the popup appear on all desktops.
+
+
+
+"""
+import os, sys, time, datetime, pickle, threading
+import dateutil
+import O365
+from PyQt5 import QtCore, QtWidgets
+
+event_cache_file = os.path.expanduser('~/.reminders_event_cache')
+config_file = os.path.expanduser('~/.reminders')
+if not os.path.exists(config_file):
+    print("Create a configuration file ~/.reminders with your username and password on the first two lines.")
+    sys.exit(-1)
+u,p = map(str.strip, open(config_file, 'r').readlines())
+sch = O365.Schedule((u, p))
+del p
+sch.getCalendars()
+calendar = [c for c in sch.calendars if c.name == 'Calendar'][0]
+
+def utc_to_local(utc_dt):
+    return utc_dt.replace(tzinfo=datetime.timezone.utc).astimezone(tz=None)
+
+def event_times(ev):
+    start = utc_to_local(datetime.datetime(*ev.getStart()[:6]))
+    end = utc_to_local(datetime.datetime(*ev.getEnd()[:6]))
+    return start, end
+
+
+if os.path.exists(event_cache_file):
+    try:
+        event_cache = pickle.load(open(event_cache_file, 'rb'))
+        print("Read events from cache file.")
+    except:
+        print("Error loading event cache; will pull from server instead.")
+else:
+    event_cache = None
+    recache_events()
+
+
+def get_events():
+    global event_cache
+    return event_cache['events']
+
+
+def download_events():
+    """Download and return all events sorted by start time.
+
+    Note: we download all old events because otherwise some repeated events
+    will be missed.
+    """
+    global calendar
+    start = time.strftime(calendar.time_string, time.localtime(3600*24*365*40))
+    end = time.strftime(calendar.time_string, time.localtime(time.time() + 3600*240))
+    calendar.getEvents(start=start, end=end, eventCount=1000000)
+    return sorted(calendar.events, key=lambda ev: ev.getStart())
+
+
+def recache_events():
+    """Download all events and write to the cache.
+    """
+    global event_cache
+    print("Reloading events..")
+    all_events = download_events()
+    now = time.time()
+    event_cache = {'events': all_events, 'time': now}
+    pickle.dump(event_cache, open(event_cache_file+'.tmp', 'wb'))
+    os.rename(event_cache_file+'.tmp', event_cache_file)
+    print("   done; downloaded %d events" % len(all_events))
+
+
+def poll_events():
+    global event_cache, run_poller
+    while run_poller:
+        now = time.time()
+        if now > event_cache['time'] + 1200:
+            try:
+                recache_events()
+            except Exception:
+                print("Error loading events from server:")
+                sys.excepthook(*sys.exc_info())
+        time.sleep(1200)
+
+run_poller = True
+poller = threading.Thread(target=poll_events)
+poller.daemon = True
+poller.start()
+
+
+def upcoming_events(window=20*60, verbose=False):
+    now = datetime.datetime.now(datetime.timezone.utc).astimezone()
+    today = now.date()
+    
+    try:
+        events = get_events()[::-1]
+    except:
+        sys.excepthook(*sys.exc_info())
+    
+    upcoming = []
+    # if verbose:
+    #     print("[filtering %d events..]" % len(events))
+    n_cancelled = 0
+    n_not_today = 0
+    n_passed = 0
+    for i,ev in enumerate(events):
+        # print(ev.getSubject())
+        evid = ev.json['Id']
+
+        if ev.json['IsCancelled']:
+            # print("   cancelled")
+            n_cancelled += 1
+            continue
+
+        start, end = event_times(ev)
+        if start.date() > today:
+            # print("   not today")
+            n_not_today += 1
+            continue
+        if end < now - datetime.timedelta(seconds=3600*8):
+            # print("   already passed")
+            # n_passed = len(events) - i
+            # break
+            n_passed += 1
+            continue
+        
+        sec = (start - now).total_seconds()
+        upcoming.append((ev, sec))
+        # print("   in %d sec" % sec)
+
+    if verbose:
+        print("[found %d upcoming events; %d cancelled, %d not today, %d already passed]" % (len(upcoming), n_cancelled, n_not_today, n_passed))
+    return upcoming[::-1]
+
+
+class ReminderDialog(QtWidgets.QWidget):
+    def __init__(self, check_interval=10.0):
+        self.current_event = None
+        self.dismissed_events = {}
+        self.snoozed_events = {}
+
+        self.format = """
+        <div style="font-weight: bold; font-size: 20pt; text-align: center">{start_time} ({how_soon} minutes)</div>
+        <div style="font-weight: bold; font-size: 15pt; text-align: center">{subject}</div>
+        <div style="font-weight: bold; font-size: 15pt; text-align: center">{location}</div>
+        <br>
+        <hr>
+        <div style="text-align: left; font-size: 12pt; font-weight: normal;">{body}</div>
+        """
+
+        QtWidgets.QWidget.__init__(self)
+        self.layout = QtWidgets.QGridLayout()
+        self.setLayout(self.layout)
+        
+        self.desc = QtWidgets.QTextBrowser()
+        self.layout.addWidget(self.desc, 0, 0, 1, 3)
+        
+        self.dismissBtn = QtWidgets.QPushButton('dismiss')
+        self.layout.addWidget(self.dismissBtn, 1, 0)
+        self.dismissBtn.clicked.connect(self.dismiss)
+
+        self.snoozeBtn = QtWidgets.QPushButton('snooze until')
+        self.layout.addWidget(self.snoozeBtn, 1, 1)
+        self.snoozeBtn.clicked.connect(self.snooze)
+        
+        self.snoozeSpin = QtWidgets.QSpinBox()
+        self.snoozeSpin.setSuffix(' minutes before')
+        self.snoozeSpin.setValue(3)
+        self.snoozeSpin.setMinimum(0)
+        self.layout.addWidget(self.snoozeSpin, 1, 2)
+
+        self.resize(600, 400)
+        self.window().setWindowFlags(QtCore.Qt.WindowStaysOnTopHint)
+        self.window().setWindowTitle("Event reminder")
+
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.check_events)
+        self.timer.start(int(check_interval*1000))
+        self.check_events()
+
+    def show_event(self, ev):
+        new_event = self.current_event is not ev
+        self.current_event = ev
+
+        start, end = event_times(ev)
+        start_str = start.strftime("%H:%M")
+        now = datetime.datetime.now(datetime.timezone.utc).astimezone()
+        mins = int((start - now).total_seconds() / 60)
+        desc = self.format.format(how_soon=mins, start_time=start_str, subject=ev.getSubject(), location=ev.getLocation()['DisplayName'], body=ev.getBody())
+
+        scroll = self.desc.verticalScrollBar().value()
+        self.desc.setHtml(desc)
+        if not new_event:
+            self.desc.verticalScrollBar().setValue(scroll)
+        self.snoozeSpin.setValue(mins//3)
+        self.show()
+        self.desc.setFocus()
+        self.activateWindow()
+        
+    def dismiss(self):
+        self.dismissed_events[self.current_event.json['Id']] = True
+        if not self.check_events():
+            self.hide()
+
+    def snooze(self):
+        self.snoozed_events[self.current_event.json['Id']] = self.snoozeSpin.value() * 60
+        if not self.check_events():
+            self.hide()
+
+    def check_events(self, verbose=True):
+        """Check upcoming events and show a notification for the next event,
+        if any.
+        """
+        if verbose:
+            # clear screen
+            # print("\033[H\033[J")  # makes ugly flashing :P
+
+            # reset cursor position
+            print("\033[0;0f")
+            rows, columns = os.popen('stty size', 'r').read().split()
+            
+            lines = 0
+            def row_print(s):
+                print(("{:%ds}"%columns).format(s))
+                lines += 1
+
+        events = upcoming_events(verbose=verbose)
+        if verbose:
+            row_print("======================================================\nUpcoming events:")
+
+        ret = False
+        for ev, how_soon in events:
+            if verbose:
+                row_print("    (%d min) %s [%s]" % (how_soon//60, ev.getSubject(), ev.getLocation()['DisplayName']))
+            if ev.json['Id'] in self.dismissed_events:
+                if verbose:
+                    row_print("        already dismissed")
+                continue
+            if ev.json['Id'] in self.snoozed_events:
+                if how_soon > self.snoozed_events[ev.json['Id']]:
+                    if verbose:
+                        row_print("        snoozing...")
+                    continue
+            if how_soon > 20*60:
+                if verbose:
+                    row_print("        not time for notification yet.")
+                continue
+            if verbose:
+                row_print("        notify!")
+            self.show_event(ev)
+            ret = True
+
+        if verbose:
+            for i in range(lines, rows):
+                row_print("")
+
+        return ret
+
+
+app = QtWidgets.QApplication([])
+
+dlg = ReminderDialog()
+
+def check():
+    dlg.check_events(verbose=True)
+
+if sys.flags.interactive == 0:
+    app.exec_()
