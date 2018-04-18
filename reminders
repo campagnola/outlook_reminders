@@ -24,7 +24,11 @@ if not os.path.exists(config_file):
 u,p = map(str.strip, open(config_file, 'r').readlines())
 sch = O365.Schedule((u, p))
 del p
-sch.getCalendars()
+try:
+    sch.getCalendars()
+except Exception:
+    raise Exception("Error retrieving calendar; check username/password.")
+
 calendar = [c for c in sch.calendars if c.name == 'Calendar'][0]
 
 def utc_to_local(utc_dt):
@@ -141,6 +145,34 @@ def upcoming_events(window=20*60, verbose=False):
     return upcoming[::-1]
 
 
+class ScreenPrint(object):
+    """Simple interface for printing full-screen text
+    """
+    def __init__(self):
+        self.current_row = 0
+        self.rows = 100
+        self.columns = 100
+
+    def reset(self):
+        self.current_row = 0
+        print("\033[0;0f")
+        self.rows, self.columns = list(map(int, os.popen('stty size', 'r').read().split()))
+
+    def print_line(self, msg):
+        while len(msg) > self.columns:
+            line, msg = msg[:self.columns], msg[self.columns:]
+            print(line)
+            self.current_row += 1
+        print(("{:%ds}" % self.columns).format(msg))
+        self.current_row += 1
+        
+    def clear_to_bottom(self):
+        for i in range(self.current_row, self.rows-1):
+            self.print_line("")
+
+screen = ScreenPrint()
+
+
 class ReminderDialog(QtWidgets.QWidget):
     def __init__(self, check_interval=10.0):
         self.current_event = None
@@ -219,48 +251,39 @@ class ReminderDialog(QtWidgets.QWidget):
         """Check upcoming events and show a notification for the next event,
         if any.
         """
+        global screen
         if verbose:
-            # clear screen
-            # print("\033[H\033[J")  # makes ugly flashing :P
-
-            # reset cursor position
-            print("\033[0;0f")
-            rows, columns = os.popen('stty size', 'r').read().split()
+            screen.reset()
             
-            lines = 0
-            def row_print(s):
-                print(("{:%ds}"%columns).format(s))
-                lines += 1
-
         events = upcoming_events(verbose=verbose)
         if verbose:
-            row_print("======================================================\nUpcoming events:")
+            screen.reset()
+            screen.print_line("Upcoming events:")
 
         ret = False
         for ev, how_soon in events:
             if verbose:
-                row_print("    (%d min) %s [%s]" % (how_soon//60, ev.getSubject(), ev.getLocation()['DisplayName']))
+                screen.print_line("    (%d min) %s [%s]" % (how_soon//60, ev.getSubject(), ev.getLocation()['DisplayName']))
             if ev.json['Id'] in self.dismissed_events:
                 if verbose:
-                    row_print("        already dismissed")
+                    screen.print_line("        already dismissed")
                 continue
             if ev.json['Id'] in self.snoozed_events:
                 if how_soon > self.snoozed_events[ev.json['Id']]:
                     if verbose:
-                        row_print("        snoozing...")
+                        screen.print_line("        snoozing...")
                     continue
             if how_soon > 20*60:
                 if verbose:
-                    row_print("        not time for notification yet.")
+                    screen.print_line("        not time for notification yet.")
                 continue
             if verbose:
-                row_print("        notify!")
+                screen.print_line("        notify!")
             self.show_event(ev)
             ret = True
 
         if verbose:
-            for i in range(lines, rows):
-                row_print("")
+            screen.clear_to_bottom()
 
         return ret
 
